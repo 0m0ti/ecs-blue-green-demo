@@ -1,5 +1,5 @@
 stack-family=ecs-blue-green-demo
-github-owner=imunew
+github-owner=0m0ti
 
 deploy-vpc-subnet:
 	aws --profile $(profile) cloudformation deploy \
