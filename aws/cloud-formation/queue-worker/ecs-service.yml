@@ -12,52 +12,137 @@ Parameters:
     Default: 512
   TaskMemory:
     Type: Number
-    Default: 1024
-  QueueWorkerMemory:
+    Default: 2048
+  NginxMemory:
     Type: Number
-    Default: 1024
+    Default: 512
+  PhpFpmMemory:
+    Type: Number
+    Default: 1536
+
+Transform:
+  - 'AWS::CodeDeployBlueGreen'
 
 Resources:
   LogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
-      LogGroupName: !Sub "${StackFamily}-queue-worker"
+      LogGroupName: !Sub "${StackFamily}-app"
       RetentionInDays: 14
 
-  ECSTaskDefinition:
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "ecs-tasks.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Path: "/"
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      RoleName: !Sub "${StackFamily}-ecs-execution"
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "ecs-tasks.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Path: "/"
+      Policies:
+        -
+          PolicyName: SQSQueue
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sqs:ChangeMessageVisibility
+                  - sqs:DeleteMessage
+                  - sqs:GetQueueAttributes
+                  - sqs:GetQueueUrl
+                  - sqs:ListQueues
+                  - sqs:ListQueueTags
+                  - sqs:ReceiveMessage
+                  - sqs:SendMessage
+                  - sqs:SetQueueAttributes
+                  - sqs:TagQueue
+                  - sqs:UntagQueue
+                Resource:
+                  - !Sub "arn:aws:sqs:${AWS::Region}:${AWS::AccountId}:${StackFamily}-queue"
+      RoleName: !Sub "${StackFamily}-ecs-task"
+
+  TaskDefinition:
     Type: AWS::ECS::TaskDefinition
     Properties:
-      Family: !Sub "${StackFamily}-queue-worker"
+      Family: !Sub "${StackFamily}-app"
       Memory: !Ref TaskMemory
-      ExecutionRoleArn: !Sub "arn:aws:iam::${AWS::AccountId}:role/${StackFamily}-ecs-execution"
-      TaskRoleArn: !Sub "arn:aws:iam::${AWS::AccountId}:role/${StackFamily}-ecs-task"
+      ExecutionRoleArn: !Ref ExecutionRole
+      TaskRoleArn: !Ref TaskRole
       NetworkMode: awsvpc
+      Volumes:
+        - Host: {}
+          Name: uds
       RequiresCompatibilities:
         - FARGATE
       Cpu: !Ref EcsCpu
       ContainerDefinitions:
-        - Name: queue-worker
-          Image: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${StackFamily}/queue-worker:latest"
+        - Name: nginx
+          Image: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${StackFamily}/nginx:latest
           LogConfiguration:
             LogDriver: awslogs
             Options:
-              awslogs-group: !Ref LogGroup
+              awslogs-group: !Sub "${StackFamily}-app"
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+          PortMappings:
+            - ContainerPort: 80
+              HostPort: 80
+              Protocol: tcp
+          Ulimits:
+            - Name: nofile
+              SoftLimit: 65536
+              HardLimit: 65536
+          MountPoints:
+            - SourceVolume: uds
+              ContainerPath: /var/run
+          Memory: !Ref NginxMemory
+        - Name: php-fpm
+          Image: !Sub ${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/${StackFamily}/php-fpm:latest
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Sub "${StackFamily}-app"
               awslogs-region: !Ref AWS::Region
               awslogs-stream-prefix: ecs
           Ulimits:
             - Name: nofile
               SoftLimit: 65536
               HardLimit: 65536
-          Memory: !Ref QueueWorkerMemory
+          MountPoints:
+            - SourceVolume: uds
+              ContainerPath: /var/run
+          Memory: !Ref PhpFpmMemory
 
-  ECSService:
+  EcsService:
     Type: AWS::ECS::Service
     Properties:
       Cluster:
         Fn::ImportValue:
           !Sub "${StackFamily}-ecs-cluster"
       LaunchType: FARGATE
-      TaskDefinition: !Ref ECSTaskDefinition
+      TaskDefinition: !Ref TaskDefinition
       DesiredCount: !Ref EcsDesiredCount
       NetworkConfiguration:
         AwsvpcConfiguration:
@@ -70,4 +155,14 @@ Resources:
           SecurityGroups:
             - Fn::ImportValue:
                 !Sub "${StackFamily}-app-sg"
-      ServiceName: !Sub "${StackFamily}-queue-worker"
+      LoadBalancers:
+        - ContainerName: nginx
+          ContainerPort: 80
+          TargetGroupArn:
+            Fn::ImportValue:
+              !Sub "${StackFamily}-target-group-blue"
+      HealthCheckGracePeriodSeconds: 30
+      ServiceName: !Sub "${StackFamily}-app"
+      DeploymentController:
+        Type: CODE_DEPLOY
+      SchedulingStrategy: "REPLICA"
